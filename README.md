@@ -65,31 +65,6 @@ python main_unlearn_framework.py --unlearn_name retrain --unlearn_type random --
 
 After unlearning the forget data, you can use `main_evaluate.py` to measure the unlearning model's performance by `CR` and `MIACR` metrics:
 
-```python
+```
 python main_evaluate.py --unlearn_name retrain --unlearn_type random --model_name resnet18 --data_name cifar10 --data_dir ./data --model_dir unlearning_model.pth --num_classes 10 --retain_ratio 0.9 --alphas 0.05,0.1,0.15,0.2
 ```
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
