@@ -23,9 +23,8 @@ def training_step(model, batch, criterion, device):
     acc = num_correct.item() / len(clabels)
     return loss, acc, num_correct
 
-
 def fit_one_cycle(
-    epochs, model, train_loader, forget_loader, test_loader, device, lr, milestones
+    epochs, model, train_loader, forget_loader, test_loader, device, lr, milestones, mask = None
 ):
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr, momentum=0.9, weight_decay=5e-4)
@@ -47,9 +46,17 @@ def fit_one_cycle(
             loss, acc, correct = training_step(model, batch, criterion, device)
             correct_num += correct
             acc_list.append(acc)
-            loss.backward()
-            optimizer.step()
             optimizer.zero_grad()
+            loss.backward()
+
+            if mask:
+                flas = 0
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        param.grad *= mask[name]
+                        flas += 1
+
+            optimizer.step()
         scheduler.step()
 
         forget_acc = evaluate_acc(model, forget_loader, device)
@@ -132,6 +139,7 @@ def RL(
     milestones,
     **kwargs,
 ):
+    print('amnesiac')
     unlearninglabels = list(range(num_classes))
     unlearning_trainset = []
 
@@ -196,6 +204,7 @@ def FisherForgetting(
 
 
     def get_mean_var(p, is_base_dist=False, alpha=3e-6, unlearn_type='random'):
+        print('unlearn_type2', unlearn_type)
         var = deepcopy(1.0 / (p.grad2_acc + 1e-8))
         var = var.clamp(max=1e3)
         if p.size(0) == num_classes:
@@ -231,6 +240,7 @@ def FisherForgetting(
     fisher_dir = []
     alpha = 1e-6
     for i, p in enumerate(model.parameters()):
+        print('unlearn_type1', unlearn_type)
         mu, var = get_mean_var(p, False, alpha, unlearn_type)
         p.data = mu + var.sqrt() * torch.empty_like(p.data0).normal_()
         fisher_dir.append(var.sqrt().view(-1).cpu().detach().numpy())
@@ -261,16 +271,23 @@ def GA(
 
     test_size = len(train_forget_dl.dataset)
 
+
     for epoch in range(num_epochs):
         start = time.time()
         correct_num = 0
+        print('epoch', epoch)
         for i, (image, target) in enumerate(train_forget_dl):
+            print('batch', i, end=' ')
             image = image.to(device)
             target = target.to(device)
 
             # compute output
             output_clean = model(image)
             loss = - criterion(output_clean, target)
+            print('loss', loss)
+            if loss < -0.4:
+                break
+
             # loss = -criterion(output_clean, target) + 0.2 * l1_regularization(model)
             optimizer.zero_grad()
             loss.backward()
@@ -279,14 +296,19 @@ def GA(
             _, pred = torch.max(output_clean, 1)
             num_correct = (pred == target).sum()
             correct_num += num_correct
+            print('batch_acc', num_correct/64)
 
+
+        train_acc = evaluate_acc(model, train_retain_dl, device)
         forget_acc = evaluate_acc(model, train_forget_dl, device)
         test_acc = evaluate_acc(model, test_retain_dl, device)
+
+        print('train_acc', train_acc, 'forget_acc', forget_acc, 'test_acc', test_acc)
         wandb.log(
-            {'epoch': epoch, 'train_acc': correct_num/test_size, 'forget_acc': forget_acc, 'test_acc': test_acc,
+            {'epoch': epoch, 'train_acc': train_acc, 'forget_acc': forget_acc, 'test_acc': test_acc,
              "lr": optimizer.param_groups[0]["lr"],
              "epoch_time": time.time() - start})
-    return evaluate_acc(model, train_retain_dl, device), forget_acc, test_acc
+    return train_acc, forget_acc, test_acc
 
 
 '''teacher'''
@@ -358,7 +380,7 @@ def blindspot_unlearner(
 
     unlearning_teacher.eval()
     full_trained_teacher.eval()
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
 
     for epoch in range(num_epochs):
         start = time.time()
@@ -371,10 +393,12 @@ def blindspot_unlearner(
             device=device,
             KL_temperature=KL_temperature,
         )
+        print("Epoch {} Unlearning Loss {}".format(epoch + 1, loss))
 
         train_acc = evaluate_acc(model, train_retain_dl, device)
-        forget_acc = evaluate_acc(model, test_retain_dl, device)
-        test_acc = evaluate_acc(model, train_forget_dl, device)
+        forget_acc = evaluate_acc(model, train_forget_dl, device)
+        test_acc = evaluate_acc(model, test_retain_dl, device)
+        print('train_acc', train_acc, 'forget_acc', forget_acc, 'test_acc', test_acc)
         wandb.log(
             {'epoch': epoch, 'train_acc': train_acc, 'forget_acc': forget_acc, 'test_acc': test_acc,
              "lr": optimizer.param_groups[0]["lr"],
@@ -393,10 +417,12 @@ def teacher(
     learning_rate,  # 0.0001
     batch_size,
     num_epochs,
+    unlearn_type,
     **kwargs,
 ):
     student_model = deepcopy(model)
-    len_retain_train_subset = int(len(train_forget_dl.dataset))
+
+    len_retain_train_subset = int(len(train_forget_dl.dataset)) if unlearn_type=='random' else int(len(train_forget_dl.dataset))*2
     retain_train_subset, _ = random_split(train_retain_dl.dataset, [len_retain_train_subset, len(train_retain_dl.dataset) - len_retain_train_subset])
 
     train_acc, forget_acc, test_acc = blindspot_unlearner(
@@ -453,10 +479,261 @@ def ssd(
 
     ssd.modify_weight(original_importances, sample_importances)
 
-    return (utils.evaluate_acc(model, test_retain_dl, device),
-            utils.evaluate_acc(model, test_retain_dl, device),
+    return (utils.evaluate_acc(model, train_retain_dl, device),
+            utils.evaluate_acc(model, train_forget_dl, device),
             utils.evaluate_acc(model, test_retain_dl, device))
 
+
+
+
+
+def salun(
+    model,
+    train_retain_dl,
+    train_forget_dl,
+    test_retain_dl,
+    test_forget_dl,
+    num_classes,
+    device,
+    num_epochs,
+    batch_size,
+    learning_rate,
+    milestones,
+    mask,
+    **kwargs,
+):
+    print('salun')
+    unlearninglabels = list(range(num_classes))
+    unlearning_trainset = []
+
+    for x, clabel in train_forget_dl.dataset:
+        rnd = random.choice(unlearninglabels)
+        while rnd == clabel:
+            rnd = random.choice(unlearninglabels)
+        unlearning_trainset.append((x, rnd))
+
+    for x, y in train_retain_dl.dataset:
+        unlearning_trainset.append((x, y))
+
+    unlearning_train_set_dl = DataLoader(
+        unlearning_trainset, batch_size=batch_size, pin_memory=True, shuffle=True
+    )
+    train_acc, forget_acc, test_acc = fit_one_cycle(
+        num_epochs, model, unlearning_train_set_dl, train_forget_dl, test_retain_dl, lr=learning_rate, device=device, milestones=milestones, mask=mask
+    )
+
+    return train_acc, forget_acc, test_acc
+
+
+def ga_plus(
+    model,
+    train_retain_dl,
+    train_forget_dl,
+    test_retain_dl,
+    test_forget_dl,
+    device,
+    num_epochs,
+    learning_rate,
+    args,
+    **kwargs
+):
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=5e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, args.num_epochs)
+
+    unlearning_data = LossData(forget_data=train_forget_dl.dataset, retain_data=train_retain_dl.dataset)
+    training_loader = DataLoader(
+        unlearning_data, batch_size=args.batch_size, shuffle=True, pin_memory=True
+    )
+
+    model.train()
+    for epoch in range(args.num_epochs):
+        start = time.time()
+        for i, batch in enumerate(training_loader):
+            loss, _, _ = training_step_ga_plus(model, batch, criterion)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+        retain_acc = evaluate_acc(model, train_retain_dl, device)
+        forget_acc = evaluate_acc(model, train_forget_dl, device)
+        test_acc = evaluate_acc(model, test_retain_dl, device)
+        wandb.log(
+            {'epoch': epoch, 'train_acc': retain_acc, 'forget_acc': forget_acc, 'test_acc': test_acc,
+             "lr": optimizer.param_groups[0]["lr"],
+             "epoch_time": time.time() - start})
+        scheduler.step()
+
+    return retain_acc, forget_acc, test_acc
+
+
+
+"""
+This file is used for the Scrub method
+"""
+###############################################
+# SCRUB ParameterPerturber
+###############################################
+def accuracy(output, target, topk=(1,)):
+    """Computes the precision@k for the specified values of k"""
+    maxk = max(topk)
+    batch_size = target.size(0)
+
+    _, pred = output.topk(maxk, 1, True, True)
+    pred = pred.t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+    res = []
+    for k in topk:
+        # correct_k = correct[:k].view(-1).float().sum(0)
+        correct_k = correct[:k].reshape(-1).float().sum(0)
+        res.append(correct_k.mul_(100.0 / batch_size))
+    return res
+
+
+class DistillKL(nn.Module):
+    """Distilling the Knowledge in a Neural Network"""
+
+    def __init__(self, T):
+        super(DistillKL, self).__init__()
+        self.T = T
+
+    def forward(self, y_s, y_t):
+        p_s = F.log_softmax(y_s / self.T, dim=1)
+        p_t = F.softmax(y_t / self.T, dim=1)
+        loss = F.kl_div(p_s, p_t, size_average=False) * (self.T ** 2) / y_s.shape[0]
+        return loss
+
+
+class AverageMeter(object):
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+
+def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, gamma, beta, split,
+                  print_freq=12, quiet=False):
+    """One epoch distillation"""
+    # set modules as train()
+    # for module in module_list:
+    #     module.train()
+    # # set teacher as eval()
+    # module_list[-1].eval()
+
+    criterion_cls = criterion_list[0]
+    criterion_div = criterion_list[1]
+    criterion_kd = criterion_list[2]
+
+    model_s = module_list[0]
+    model_t = module_list[-1]
+    model_s.train()
+    model_t.eval()
+
+    batch_time = AverageMeter()
+    data_time = AverageMeter()
+    losses = AverageMeter()
+    kd_losses = AverageMeter()
+    top1 = AverageMeter()
+    top5 = AverageMeter()
+    acc_max_top1 = AverageMeter()
+
+    print('gamma', gamma, 'beta', beta)
+    end = time.time()
+    for idx, (input, target) in enumerate(train_loader):
+
+        input = input.cuda()
+        target = target.cuda()
+        data_time.update(time.time() - end)
+
+        input = torch.Tensor(input).float()
+        # target = torch.squeeze(torch.Tensor(target).long())
+
+        # ===================forward=====================
+        logit_s = model_s(input)
+        with torch.no_grad():
+            logit_t = model_t(input)
+
+        # cls + kl div
+        loss_cls = criterion_cls(logit_s, target)
+        loss_div = criterion_div(logit_s, logit_t)
+        loss_kd = 0
+
+        if split == "minimize":
+            loss = gamma * loss_cls + beta * loss_div
+
+        elif split == "maximize":
+            loss = -loss_div
+
+        if split == "minimize" and not quiet:
+            acc1, acc5 = accuracy(logit_s, target, topk=(1, 5))
+            losses.update(loss.item(), input.size(0))
+            top1.update(acc1.item(), input.size(0))
+            top5.update(acc5.item(), input.size(0))
+        elif split == "maximize" and not quiet:
+            kd_losses.update(loss.item(), input.size(0))
+            acc_max, _ = accuracy(logit_s, target, topk=(1, 5))
+            acc_max_top1.update(acc_max.item(), input.size(0))
+
+        # ===================backward=====================
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        # ===================meters=====================
+        batch_time.update(time.time() - end)
+        end = time.time()
+
+    if split == "maximize":
+        if not quiet:
+            # if idx % print_freq == 0:
+            print('*** Maximize step ***')
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Forget_Acc@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                epoch, idx, len(train_loader), batch_time=batch_time,
+                data_time=data_time, loss=kd_losses, top1=acc_max_top1))
+            # sys.stdout.flush()
+    elif split == "minimize":
+        if not quiet:
+            print('*** Minimize step ***')
+            # print(' * Acc@1 {top1.avg:.3f} '.format(top1=top1))
+            print('Epoch: [{0}][{1}/{2}]\t'
+                  'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
+                  'Data {data_time.val:.3f} ({data_time.avg:.3f})\t'
+                  'Loss {loss.val:.4f} ({loss.avg:.4f})\t'
+                  'Retain_Acc@1 {top1.val:.3f} ({top1.avg:.3f})'.format(
+                epoch, idx, len(train_loader), batch_time=batch_time,
+                data_time=data_time, loss=losses, top1=top1))
+
+        return top1.avg, losses.avg
+    else:
+        # module_list[0] = model_s
+        # module_list[-1] = model_t
+        return kd_losses.avg
+
+
+
+"""
+This file is used for the Selective Synaptic Dampening method
+Strategy files use the methods from here
+"""
+###############################################
+# SSD ParameterPerturber
+###############################################
 
 class ParameterPerturber:
     def __init__(
@@ -472,6 +749,7 @@ class ParameterPerturber:
         self.alpha = None
         self.xmin = None
 
+        print(parameters)
         self.lower_bound = parameters["lower_bound"]
         self.exponent = parameters["exponent"]
         self.magnitude_diff = parameters["magnitude_diff"]  # unused
@@ -627,6 +905,7 @@ class ParameterPerturber:
                 original_importance.items(),
                 forget_importance.items(),
             ):
+                # print(f"{n} before: {p.sum()}")
 
                 # Synapse Selection with parameter alpha
                 oimp_norm = oimp.mul(self.selection_weighting)
@@ -641,6 +920,7 @@ class ParameterPerturber:
                 min_locs = torch.where(update > self.lower_bound)
                 update[min_locs] = self.lower_bound
                 p[locations] = p[locations].mul(update)
+                # print(f"{n} after: {p.sum()}")
 
 
 ###############################################
@@ -686,3 +966,26 @@ class LossData(Dataset):
             x, y = self.retain_data[index - self.forget_len]
             label = 0
             return x, y, label
+
+
+### ga_plus
+def training_step_ga_plus(model, batch, criterion):
+    device = next(model.parameters()).device
+    images, clabels, labels = batch
+    images, clabels, labels = images.to(device), clabels.to(device), labels.to(device)
+
+    out = model(images)
+
+    retain_mask = (labels == 0)
+    forget_mask = (labels == 1)
+
+    retain_logits = out[retain_mask]
+    retain_clabels = clabels[retain_mask]
+    loss_retain = criterion(retain_logits, retain_clabels)
+
+    forget_logits = out[forget_mask]
+    forget_clabels = clabels[forget_mask]
+    loss_forget = criterion(forget_logits, forget_clabels)
+
+    loss = loss_retain - 0.05*loss_forget  # Calculate loss
+    return loss, loss_retain, loss_forget
