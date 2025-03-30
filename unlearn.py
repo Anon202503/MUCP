@@ -11,6 +11,11 @@ from torch.nn import functional as F
 import random
 from typing import Dict, List
 from utils import evaluate_acc
+import math
+import random
+from collections import OrderedDict
+from SFRon import SFRon
+
 
 '''basic func'''
 def training_step(model, batch, criterion, device):
@@ -139,7 +144,6 @@ def RL(
     milestones,
     **kwargs,
 ):
-    print('amnesiac')
     unlearninglabels = list(range(num_classes))
     unlearning_trainset = []
 
@@ -204,7 +208,6 @@ def FisherForgetting(
 
 
     def get_mean_var(p, is_base_dist=False, alpha=3e-6, unlearn_type='random'):
-        print('unlearn_type2', unlearn_type)
         var = deepcopy(1.0 / (p.grad2_acc + 1e-8))
         var = var.clamp(max=1e3)
         if p.size(0) == num_classes:
@@ -240,7 +243,6 @@ def FisherForgetting(
     fisher_dir = []
     alpha = 1e-6
     for i, p in enumerate(model.parameters()):
-        print('unlearn_type1', unlearn_type)
         mu, var = get_mean_var(p, False, alpha, unlearn_type)
         p.data = mu + var.sqrt() * torch.empty_like(p.data0).normal_()
         fisher_dir.append(var.sqrt().view(-1).cpu().detach().numpy())
@@ -275,18 +277,13 @@ def GA(
     for epoch in range(num_epochs):
         start = time.time()
         correct_num = 0
-        print('epoch', epoch)
         for i, (image, target) in enumerate(train_forget_dl):
-            print('batch', i, end=' ')
             image = image.to(device)
             target = target.to(device)
 
             # compute output
             output_clean = model(image)
             loss = - criterion(output_clean, target)
-            print('loss', loss)
-            if loss < -0.4:
-                break
 
             # loss = -criterion(output_clean, target) + 0.2 * l1_regularization(model)
             optimizer.zero_grad()
@@ -296,14 +293,12 @@ def GA(
             _, pred = torch.max(output_clean, 1)
             num_correct = (pred == target).sum()
             correct_num += num_correct
-            print('batch_acc', num_correct/64)
 
 
         train_acc = evaluate_acc(model, train_retain_dl, device)
         forget_acc = evaluate_acc(model, train_forget_dl, device)
         test_acc = evaluate_acc(model, test_retain_dl, device)
 
-        print('train_acc', train_acc, 'forget_acc', forget_acc, 'test_acc', test_acc)
         wandb.log(
             {'epoch': epoch, 'train_acc': train_acc, 'forget_acc': forget_acc, 'test_acc': test_acc,
              "lr": optimizer.param_groups[0]["lr"],
@@ -398,7 +393,7 @@ def blindspot_unlearner(
         train_acc = evaluate_acc(model, train_retain_dl, device)
         forget_acc = evaluate_acc(model, train_forget_dl, device)
         test_acc = evaluate_acc(model, test_retain_dl, device)
-        print('train_acc', train_acc, 'forget_acc', forget_acc, 'test_acc', test_acc)
+
         wandb.log(
             {'epoch': epoch, 'train_acc': train_acc, 'forget_acc': forget_acc, 'test_acc': test_acc,
              "lr": optimizer.param_groups[0]["lr"],
@@ -484,9 +479,6 @@ def ssd(
             utils.evaluate_acc(model, test_retain_dl, device))
 
 
-
-
-
 def salun(
     model,
     train_retain_dl,
@@ -502,7 +494,6 @@ def salun(
     mask,
     **kwargs,
 ):
-    print('salun')
     unlearninglabels = list(range(num_classes))
     unlearning_trainset = []
 
@@ -567,6 +558,44 @@ def ga_plus(
 
     return retain_acc, forget_acc, test_acc
 
+
+def sfron(
+    model,
+    train_retain_dl,
+    train_forget_dl,
+    test_retain_dl,
+    test_forget_dl,
+    num_classes,
+    device,
+    save_dir,
+    args,
+    **kwargs,
+):
+
+    acc_r, acc_f, acc_t = (utils.evaluate_acc(model, train_retain_dl, device),
+     utils.evaluate_acc(model, train_forget_dl, device),
+     utils.evaluate_acc(model, test_retain_dl, device))
+    print('acc_r, acc_f, acc_t1', acc_r, acc_f, acc_t)
+
+    loss_function = nn.CrossEntropyLoss()
+    unlearn_dataloaders = OrderedDict(
+        forget_train=train_forget_dl,
+        retain_train=train_retain_dl,
+        forget_valid=test_forget_dl,
+        retain_valid=test_retain_dl
+    )
+
+    unlearn_method = SFRon(model, loss_function, save_dir, args)
+    unlearn_method.prepare_unlearn(unlearn_dataloaders)
+    model = unlearn_method.get_unlearned_model()
+
+    acc_r, acc_f, acc_t = (utils.evaluate_acc(model, train_retain_dl, device),
+     utils.evaluate_acc(model, train_forget_dl, device),
+     utils.evaluate_acc(model, test_retain_dl, device))
+
+    print('acc_r, acc_f, acc_t2', acc_r, acc_f, acc_t)
+
+    return acc_r, acc_f, acc_t, model
 
 
 """
@@ -649,7 +678,6 @@ def train_distill(epoch, train_loader, module_list, criterion_list, optimizer, g
     top5 = AverageMeter()
     acc_max_top1 = AverageMeter()
 
-    print('gamma', gamma, 'beta', beta)
     end = time.time()
     for idx, (input, target) in enumerate(train_loader):
 
@@ -987,5 +1015,5 @@ def training_step_ga_plus(model, batch, criterion):
     forget_clabels = clabels[forget_mask]
     loss_forget = criterion(forget_logits, forget_clabels)
 
-    loss = loss_retain - 0.05*loss_forget  # Calculate loss
+    loss = loss_retain - 0.001*loss_forget  # Calculate loss
     return loss, loss_retain, loss_forget

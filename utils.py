@@ -1,15 +1,23 @@
 import torch
+import torch.nn as nn
 from torch.utils.data import Subset, DataLoader, random_split
 import numpy as np
+import torch.nn.functional as F
+from tqdm import tqdm
+import skimage as sk
+from skimage.filters import gaussian
 import torchvision.transforms.functional
+from PIL import ImageFilter
 import torchvision.transforms as transforms
 import random
 import matplotlib.pyplot as plt
 
+def generate_dataset(
+        unlearn_type, num_classes, batch_size, root,
+        data_name, model_name, retain_ratio=0.9, shuffle=True):
 
-def generate_dataset(unlearn_type, num_classes, batch_size, root, data_name, model_name, retain_ratio=0.9, shuffle=True):
+    train_ds, test_ds, cal_ds = get_dataset(root, data_name, model_name)
 
-    data_loader_train, data_loader_test, train_ds, test_ds = get_dataset(batch_size, root, data_name, model_name, shuffle)
     if unlearn_type == 'random':
         dataset_len = len(train_ds)
         retain_size = int(dataset_len * retain_ratio)
@@ -18,30 +26,43 @@ def generate_dataset(unlearn_type, num_classes, batch_size, root, data_name, mod
         retain_loader = DataLoader(retain_ds, batch_size=batch_size, shuffle=shuffle, num_workers=0)
         forget_loader = DataLoader(forget_ds, batch_size=batch_size, shuffle=shuffle, num_workers=0)
         test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+        retain_cal_loader = DataLoader(cal_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-        return retain_loader, forget_loader, test_loader, None
+        return (retain_loader, forget_loader,
+                test_loader, None,
+                retain_cal_loader, None, -1)
+
     elif unlearn_type == 'class':
         random_class = random.randint(0, num_classes-1)
+        print('random_class', random_class)
 
         forget_indices_train = [i for i in range(len(train_ds)) if train_ds.targets[i] == random_class]
         retain_indices_train = [i for i in range(len(train_ds)) if train_ds.targets[i] != random_class]
         forget_indices_test = [i for i in range(len(test_ds)) if test_ds.targets[i] == random_class]
         retain_indices_test = [i for i in range(len(test_ds)) if test_ds.targets[i] != random_class]
+        forget_indices_cal = [i for i in range(len(cal_ds)) if cal_ds.targets[i] == random_class]
+        retain_indices_cal = [i for i in range(len(cal_ds)) if cal_ds.targets[i] != random_class]
 
         forget_train_ds = Subset(train_ds, forget_indices_train)
         retain_train_ds = Subset(train_ds, retain_indices_train)
         forget_test_ds = Subset(test_ds, forget_indices_test)
         retain_test_ds = Subset(test_ds, retain_indices_test)
+        forget_cal_ds = Subset(cal_ds, forget_indices_cal)
+        retain_cal_ds = Subset(cal_ds, retain_indices_cal)
 
         train_forget_dataloader = DataLoader(forget_train_ds, batch_size=batch_size, shuffle=shuffle, num_workers=0)
         train_retain_dataloader = DataLoader(retain_train_ds, batch_size=batch_size, shuffle=shuffle, num_workers=0)
         test_forget_dataloader = DataLoader(forget_test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
         test_retain_dataloader = DataLoader(retain_test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+        cal_forget_dataloader = DataLoader(forget_cal_ds, batch_size=batch_size, shuffle=False, num_workers=0)
+        cal_retain_dataloader = DataLoader(retain_cal_ds, batch_size=batch_size, shuffle=False, num_workers=0)
 
-        return (train_retain_dataloader, train_forget_dataloader, test_retain_dataloader, test_forget_dataloader)
+        return (train_retain_dataloader, train_forget_dataloader,
+                test_retain_dataloader, test_forget_dataloader,
+                cal_retain_dataloader, cal_forget_dataloader, random_class)
 
 
-def get_dataset(batch_size, root, data_name, model_name, shuffle=True):
+def get_dataset(root, data_name, model_name):
     if data_name == 'cifar10':
         normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2023, 0.1994, 0.2010])
         image_size = 32
@@ -99,19 +120,19 @@ def get_dataset(batch_size, root, data_name, model_name, shuffle=True):
     if data_name == 'cifar10':
         data_train = torchvision.datasets.CIFAR10(root=root, train=True, download=True, transform=transform_train)
         data_test = torchvision.datasets.CIFAR10(root=root, train=False, download=True, transform=transform_test)
+        calibration_indices = np.random.choice(len(data_test), 2000, replace=False)
+        data_cal = torch.utils.data.Subset(data_test, calibration_indices)
     elif data_name == 'cifar100':
         data_train = torchvision.datasets.CIFAR100(root=root, train=True, download=True, transform=transform_train)
         data_test = torchvision.datasets.CIFAR100(root=root, train=False, download=True, transform=transform_test)
+        calibration_indices = np.random.choice(len(data_test), 2000, replace=False)
+        data_cal = torch.utils.data.Subset(data_test, calibration_indices)
+    elif data_name == 'tiny_imagenet':
+        data_train = torchvision.datasets.ImageFolder(root='./data/tiny-imagenet-200/train', transform=transform_train)
+        data_test = torchvision.datasets.ImageFolder(root='./data/tiny-imagenet-200/val', transform=transform_test)
+        data_cal = torchvision.datasets.ImageFolder(root='./data/tiny-imagenet-200/cal', transform=transform_test)
 
-    data_loader_train = DataLoader(dataset=data_train,
-                                   batch_size=batch_size,
-                                   shuffle=shuffle,
-                                   pin_memory=True)
-    data_loader_test = DataLoader(dataset=data_test,
-                                  batch_size=batch_size,
-                                  shuffle=False,
-                                  pin_memory=True)
-    return data_loader_train, data_loader_test, data_train, data_test
+    return data_train, data_test, data_cal
 
 
 '''
@@ -147,6 +168,14 @@ def setup_seed(seed):
     random.seed(seed)
     torch.backends.cudnn.deterministic = True
 
+def generate_excel_name(model_dir, corruption_type, corruption_level, unlearn_type, unlearn_name, seed):
+    if unlearn_type is None:
+        unlearn_type = 'None'
+    # sheet_name = model_dir.split('/')[-2]
+    sheet_name = f'{unlearn_name}_{unlearn_type}_{corruption_type}_{corruption_level}'
+    xlsx_path = '/'.join(model_dir.split('/')[0:-1])+'/'+sheet_name+'final.xls'
+    return sheet_name, xlsx_path
+
 def imshow(img):
     img = img / 2 + 0.5
     npimg = img.numpy()
@@ -157,16 +186,10 @@ def show_images(dataset_original, index):
     original_img, original_label = dataset_original[index]
     fig, axs = plt.subplots(1, 2, figsize=(8, 4))
 
+    # 显示原始图片
     axs[0].imshow(original_img)
     axs[0].set_title(f'Original Image\nLabel: {original_label}')
 
     plt.show()
 
 
-def load_model(net, model_path):
-    state_dict = torch.load(model_path, weights_only=True)
-    if list(state_dict.keys())[0].startswith("module.") and not isinstance(net, torch.nn.DataParallel):
-        state_dict = {k[len("module."):]: v for k, v in state_dict.items()}
-    elif not list(state_dict.keys())[0].startswith("module.") and isinstance(net, torch.nn.DataParallel):
-        state_dict = {"module." + k: v for k, v in state_dict.items()}
-    net.load_state_dict(state_dict)
