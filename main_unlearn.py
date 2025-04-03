@@ -147,14 +147,7 @@ if __name__ == '__main__':
     }
 
     start = time.time()
-    if args.unlearn_name == 'sfron':
-        train_acc, forget_acc, test_acc, net = getattr(unlearn, args.unlearn_name)(
-            **kwargs
-        )
-    else:
-        train_acc, forget_acc, test_acc = getattr(unlearn, args.unlearn_name)(
-            **kwargs
-        )
+    train_acc, forget_acc, test_acc, *extra = getattr(unlearn, args.unlearn_name)(**kwargs)
     print('train_acc', train_acc, 'forget_acc', forget_acc, 'test_acc', test_acc)
     wandb.save("wandb_{}_{}_{}_{}_{}.h5".format(args.model_name, args.data_name, args.unlearn_name, args.num_epochs, args.learning_rate))
     torch.save(net.state_dict(), os.path.join(save_dir, 'seed_'+str(args.seed)+'.pth'))
